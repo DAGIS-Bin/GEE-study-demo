@@ -1,0 +1,44 @@
+// 定义文件夹路径（资产目录）
+var folderPath = '';
+
+// 获取指定文件夹下所有资产的列表
+var assetList = ee.data.listAssets(folderPath).assets;
+print(assetList)
+
+// 过滤出 FeatureCollection 类型的资产
+var featureCollections = assetList.filter(function(asset) {
+  return asset.type === 'TABLE' && asset.name.indexOf('merged') === -1;
+});
+print(featureCollections)
+
+
+/*
+//merge featureCollection
+var mergedCollection = ee.FeatureCollection([]);
+
+featureCollections.forEach(function(asset) {
+  var fc = ee.FeatureCollection(asset.id);
+  mergedCollection = mergedCollection.merge(fc);
+});
+
+// 保存合并后的 FeatureCollection 到新的资产中
+var mergedAssetPath = '';
+Export.table.toAsset({
+  collection: mergedCollection,
+  description: 'merged',
+  assetId: mergedAssetPath
+});
+
+// 可选：查看合并后的 FeatureCollection
+Map.addLayer(mergedCollection, {}, 'Merged FeatureCollection');
+Map.centerObject(mergedCollection, 6);
+
+// 输出合并后的结果数量
+print('Number of features in merged collection:', mergedCollection.size());
+*/
+
+// 删除原始的 FeatureCollection 资产
+featureCollections.forEach(function(asset) {
+  // 删除每个资产
+  ee.data.deleteAsset(asset.id);
+});
