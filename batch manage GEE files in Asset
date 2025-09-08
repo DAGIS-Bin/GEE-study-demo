@@ -26,6 +26,12 @@ except Exception as e:
 asset_list = ee.data.listAssets({'parent': folder}).get('assets', [])
 print(f"找到 {len(asset_list)} 个资产。")
 
+# 过滤条件：type == 'TABLE' 且名字不包含 '_samples'
+asset_list = [
+    asset for asset in asset_list
+    if asset['type'] == 'TABLE' and '_samples' not in asset['name']
+]
+
 # ---------------------------
 # 4. 批量删除（带进度条）
 # ---------------------------
