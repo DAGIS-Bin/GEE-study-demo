@@ -1,0 +1,447 @@
+// helper function to convert qa bit image to flag
+function extractBits(image, start, end, newName) {
+    // Compute the bits we need to extract.
+    var pattern = 0;
+    for (var i = start; i <= end; i++) {
+       pattern += Math.pow(2, i);
+    }
+    // Return a single band image of the extracted QA bits, giving the band
+    // a new name.
+    return image.select([0], [newName])
+                  .bitwiseAnd(pattern)
+                  .rightShift(start);
+}
+
+// function to get a Difference mattrix of specified order
+// on the input matrix. takes matrix and order as parameters
+function getDifferenceMatrix(inputMatrix, order){
+    var rowCount = ee.Number(inputMatrix.length().get([0]));
+    var left = inputMatrix.slice(0,0,rowCount.subtract(1));
+    var right = inputMatrix.slice(0,1,rowCount);
+    if (order > 1 ){
+        return getDifferenceMatrix(left.subtract(right), order-1)}
+    return left.subtract(right);
+}
+
+// unpacks an array image into images and bands
+// takes an array image, list of image IDs and list of band names as arguments
+function unpack(arrayImage, imageIds, bands){
+    
+    function iter(item, icoll){
+        
+        function innerIter(innerItem, innerList){
+            return ee.List(innerList).add(ee.String(item).cat("_").cat(ee.String(innerItem)))}
+        
+        var temp = bands.iterate(innerIter, ee.List([]));
+        return ee.ImageCollection(icoll)
+            .merge(ee.ImageCollection(ee.Image(arrayImage).select(temp,bands).set("id",item)))}
+
+    var imgcoll  = ee.ImageCollection(imageIds.iterate(iter, ee.ImageCollection([])));
+    return imgcoll}
+
+
+
+// Function to compute the inverse log ratio of a regression results to 
+// transform back to percent units
+function inverseLogRatio(image) {
+  var bands = image.bandNames();
+  var t = image.get("system:time_start");
+  var ilrImage = ee.Image(100).divide(ee.Image(1).add(image.exp())).rename(bands);
+  return ilrImage.set("system:time_start",t);
+}
+
+function whittaker(imageCollection, isCompositional, lambda){
+  // quick configs to set defaults
+  if (isCompositional === undefined || isCompositional !==true) isCompositional = false;
+  if (lambda === undefined ) lambda = 2; //  predefined lambda = 10;
+
+  // procedure start  
+  var ic = imageCollection.map(function(image){
+     var t = image.get("system:time_start");
+    return image.toFloat().set("system:time_start",t);
+  });
+
+  var dimension = ic.size();
+  var identity_mat = ee.Array.identity(dimension);
+  var difference_mat = getDifferenceMatrix(identity_mat,3);
+  var difference_mat_transpose = difference_mat.transpose();
+  var lamda_difference_mat = difference_mat_transpose.multiply(lambda);
+  var res_mat = lamda_difference_mat.matrixMultiply(difference_mat);
+  var hat_matrix = res_mat.add(identity_mat);
+
+  
+  // backing up original data
+  var original = ic;
+
+  // get original image properties
+  var properties = ee.List(ic.iterate(function(image, list){
+    return ee.List(list).add(image.toDictionary());
+  },[]));
+  
+  var time = ee.List(ic.iterate(function(image, list){
+    return ee.List(list).add(image.get("system:time_start"));
+  },[]));
+  
+  // if data is compositional
+  // calculate the logratio of an image between 0 and 100. First
+  // clamps between delta and 100-delta, where delta is a small positive value.
+  if (isCompositional){
+    ic = ic.map(function(image){
+      var t = image.get("system:time_start");
+      var delta = 0.001;
+      var bands = image.bandNames();
+      image = image.clamp(delta,100-delta);
+      image = (ee.Image.constant(100).subtract(image)).divide(image).log().rename(bands);
+      return image.set("system:time_start",t);
+    });
+  }
+
+  var arrayImage = original.toArray();
+  var coeffimage = ee.Image(hat_matrix);
+  var smoothImage = coeffimage.matrixSolve(arrayImage);
+  
+  var idlist = ee.List(ic.iterate(function(image, list){
+    return ee.List(list).add(image.id());
+  },[]));
+  var bandlist = ee.Image(ic.first()).bandNames();
+  
+  var flatImage = smoothImage.arrayFlatten([idlist,bandlist]);
+  var smoothCollection = ee.ImageCollection(unpack(flatImage, idlist, bandlist));
+  
+  if (isCompositional){
+    smoothCollection = smoothCollection.map(inverseLogRatio);
+  }
+  // get new band names by adding suffix fitted
+  var newBandNames = bandlist.map(function(band){return ee.String(band).cat("_fitted")});
+  // rename the bands in smoothened images
+  smoothCollection = smoothCollection.map(function(image){return ee.Image(image).rename(newBandNames)});
+  
+  // a really dumb way to loose the google earth engine generated ID so that the two
+  // images can be combined for the chart
+  var dumbimg = arrayImage.arrayFlatten([idlist,bandlist]);
+  var dumbcoll = ee.ImageCollection(unpack(dumbimg,idlist, bandlist));
+  var outCollection = dumbcoll.combine(smoothCollection);
+  
+  var outCollectionProp = outCollection.iterate(function(image,list){
+    var t = image.get("system:time_start");
+    return ee.List(list).add(image.set(properties.get(ee.List(list).size())));
+  },[]);
+
+  var outCollectionProp = outCollection.iterate(function(image,list){
+    return ee.List(list).add(image.set("system:time_start",time.get(ee.List(list).size())));
+  },[]);
+
+
+  var residue_sq = smoothImage.subtract(arrayImage).pow(ee.Image(2)).divide(dimension);
+  var rmse_array = residue_sq.arrayReduce(ee.Reducer.sum(),[0]).pow(ee.Image(1/2));
+  
+  var rmseImage = rmse_array.arrayFlatten([["rmse"],bandlist]);
+  
+  return [ee.ImageCollection.fromImages(outCollectionProp), rmseImage];
+}
+
+//HANTS
+function HANTS(imgCol,dependent){
+  // Use these independent variables in the harmonic regression.
+  var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin']);
+  
+  // Add harmonic terms as new image bands.
+  var harmonicCol = imgCol.map(function(image) {
+    var timeRadians = image.select('t').multiply(2 * Math.PI);
+    var sinCoeff = timeRadians.sin();
+    var cosCoeff = timeRadians.cos();
+    var phase = cosCoeff.atan2(sinCoeff);
+    var amplitude = cosCoeff.hypot(sinCoeff);
+    return image
+      .addBands(sinCoeff.rename('cos'))
+      .addBands(cosCoeff.rename('sin'))
+      .addBands(phase.rename('phase'))//相位角
+      .addBands(amplitude.rename('amplitude'));//振幅;
+  });
+  // The output of the regression reduction is a 4x1 array image.
+  var harmonicTrend = harmonicCol
+    .select(harmonicIndependents.add(dependent))
+    .reduce(ee.Reducer.linearRegression(harmonicIndependents.length(), 1));
+  // Turn the array image into a multi-band image of coefficients.
+  var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+    .arrayProject([0])
+    .arrayFlatten([harmonicIndependents]);
+  print('harmonicTrendCoefficients',harmonicTrendCoefficients);
+  // Compute fitted values.
+  var fittedHarmonic = harmonicCol.map(function(image) {
+    return image.addBands(
+      image.select(harmonicIndependents)
+        .multiply(harmonicTrendCoefficients)
+        .reduce('sum')
+        .rename('fitted'))
+        ;
+  });
+  return fittedHarmonic;
+}
+/*****************************************************************
+ * 
+ * The Harmonic ANalysis of Time Series (HANTS) was proposed by Verheof (1996) and Menenti et al. (1993)
+  to reconstruct time series of remote sensing products such as NDVI and LAI.
+  The algorithm had been widely used in the remote sensing community and implemented 
+  in Fortran, IDL/ENVI, Matlab, C, and Python.   
+  The script in this file aim to implement the HANTS in GEE, which can avoid 
+  donwloading large volume dataset to local PC and also make full use of the 
+  powerfull computation resource of GEE.
+  
+The kernel fucntion for HANTS.
+Parameters:
+- imgCol [In: ee.Imagecollection] : 
+         the ImageCollection to be reconstructed, of which each image only 
+         contain one band named "dependentBand";
+- numHarm [In: numeric (Integer),optional, default: 4] : 
+          the number of hamonics (excludes the zero-frequency) used during 
+          reconstruction;
+- fet [In: numeric (float), optional, default: 0.05 ]: 
+          fitting error tolerence;
+- hilo [In: string, optional, default: 'Low' ]: 
+          direction of outliers, can be set among:
+          'Low':outliers are lower than actual observations, e.g. cloudy observations in NDVI signals.
+          'high':outliers are higher than actual observations, e.g. cloudy observations in albedo signals
+          'None':no biased outliers but only random noise in the singal, 
+                    in which case HANTS only used for smoothing;
+- dod [In: numeric (Integer), optional, default: 5 ]: 
+          degree of over-determinedness;
+- maxiterations [In: numeric (Integer), optional, default: 5 ]: 
+          the maximum iterations for outlier detection;
+- newOut [In/Out: object, optional, default: null]: 
+          by default, this function return result ImageCollections with the 
+          same timestamps (date) as input ImageCollections (imgCol)
+          (see Return Value).
+          User-dedined timestamps can be set by "newOut". "newOut" should be 
+          provided as an object: 
+          {interval: numerical (integer), interval for output timestamps,
+           outReconCol: result ImageCollections with new output timestamps.}
+- coefficients [In/Out: object, optional, default: null]:
+          If set, the coefficients for each harmonic components will be returned.
+          structure: harmonicCoefficients=
+                        {numHarm: integer, number of harmonic
+                        coef: ee.Image, there are 2*numHarm+1 bands 
+                                inside the image}
+Return Value:
+Result ImageCollection with same timestamps with the input ImageCollection.
+
+Attentions:
+- Currently, the iteration procedure is terminated by maximum interations instead
+ of FET or DoD, which need to be improved further.
+*/
+//
+function zhou_HANTS(imgCol, dependent, numHarm, fet, hilo, newOut, coefficients, dod, maxIter){
+  if(numHarm===undefined){numHarm=4}
+  if(fet===undefined){fet=0.05}
+  if(hilo===undefined){hilo='Low'}
+  if(dod===undefined){dod=5 }
+  if(maxIter===undefined){maxIter=5}
+  
+  // The dependent variable we are modeling, i.e the orignal signals to be processed.
+  // var dependent = 'dependentBand';
+  
+  // The number of cycles per year to model.
+  var harmonics = numHarm;
+  
+  // Make a list of harmonic frequencies to model.
+  // These also serve as band name suffixes.
+  // by "cat([0.5])" a harmonic with double periods of base period is used to account
+  // trends within the base period.
+  var harmonicFrequencies = ee.List.sequence(1, harmonics).cat([0.5]);
+  
+  //print(harmonicFrequencies);
+  
+  // Function to get a sequence of band names for harmonic terms.
+  var constructBandNames = function(base, list) {
+    return ee.List.sequence(1,(list.length())).map(function(i) {
+      return ee.String(base).cat(ee.Number(i).int());//
+    });
+  };
+  
+  // Construct lists of names for the harmonic terms.
+  var cosNames = constructBandNames('cos_', harmonicFrequencies);
+  var sinNames = constructBandNames('sin_', harmonicFrequencies);
+  
+  // Independent variables.
+  var independents = ee.List(['constant'])
+    .cat(cosNames).cat(sinNames);//.cat(['poly1','poly2']);
+  
+  
+  // Function to add a time band.
+  var addDependents = function(image) {
+    // Compute time in fractional years since the epoch.
+    var years = image.date().difference('2006-01-01', 'year');
+    var timeRadians = ee.Image(years.multiply(2 * Math.PI)).rename('t');
+    var constant = ee.Image(1);
+    //var poly1 = ee.Image(years.pow(2)).rename('poly1');
+    //var poly2 = ee.Image(years.pow(3)).rename('poly2');
+    return image.addBands(constant).addBands(timeRadians.float());
+                //.addBands(poly1.float()).addBands(poly2.float());
+  };
+  
+  // Function to compute the specified number of harmonics
+  // and add them as bands.  Assumes the time band is present.
+  var addHarmonics = function(freqs) {
+    return function(image) {
+      // Make an image of frequencies.
+      var frequencies = ee.Image.constant(freqs);
+      // This band should represent time in radians.
+      var time = ee.Image(image).select('t');
+      // Get the cosine terms.
+      var cosines = time.multiply(frequencies).cos().rename(cosNames);
+      // Get the sin terms.
+      var sines = time.multiply(frequencies).sin().rename(sinNames);
+      return image.addBands(cosines).addBands(sines);
+    };
+  };
+  
+  //Compute fitted values and residual for a image
+  var fitName = 'fitted';
+  var hiloflag = hilo==='Low'?1:-1;
+  var imgfit = function(harmonicTrendCoefficients){
+    return function(img) {
+        
+          //update the fitted value band
+          var fitted = 
+            img.select(independents)
+              .multiply(harmonicTrendCoefficients)
+              .reduce('sum')
+              .rename(fitName);
+          
+          //update the residual band
+          var residual = fitted.subtract(img.select(dependent));//.subtract(fitted);
+          
+          //Update the mask of original NDVI band.
+          /*During the iteration, we should only update the mask of raw NDVI observation 
+          but keep all other band un-effected.
+          */
+          var unChangedMask = img.mask().select(img.bandNames().remove(dependent));
+          //this is the new mask for the raw NDVI.
+          var dependentMask = residual.multiply(hiloflag).lt(ee.Image.constant(fet)).select([0],[dependent]);
+          //prevent pixels without enough valid observation from further outlier removing
+          dependentMask=dependentMask.or(mask1).rename(['mask']);
+          var mask = ee.Image.cat(dependentMask, unChangedMask);
+            
+          return img.updateMask(mask).addBands(fitted,[fitName],true)
+                    .addBands(dependentMask,['mask'],true);
+                    //.addBands(residual.rename(['residual']),null,true);
+        
+      };
+  };
+  // add all variables.
+  var reconCol = imgCol
+    .map(addDependents)
+    .map(addHarmonics(harmonicFrequencies));
+    /*.map(function(img){
+      var fittedImg = ee.Image(0).rename("fitted");
+      return img.addBands(fittedImg);
+    });*/
+  
+    
+  
+  //maximum number of iterations
+  maxIter = hilo==='None'?1:maxIter;// if no biased outlier in the time series, 
+                                       //only one iteration is applied to smooth the series.
+  var independents1=independents.remove('constant');
+  
+  
+  
+  var minObs=(numHarm+1)*2+1+dod; 
+  //var validCount=reconCol.select(dependent).count();
+  
+  
+  //mask for pixel without enough valid observations, the reconstruction result of these pixels shoud be filled with invalid value(99999 by default).
+  //var mask1=validCount.lt(minObs);
+  //Map.addLayer(mask1, {palette: ['00FFFF', '0000FF']},'initial validobs count');
+  
+  //regression iteration
+  while(maxIter){
+    
+     //mask out pixels without enough valid observations (i.e. valid obs. < 12)
+    var validCount = reconCol.select(dependent).count();
+    var mask1=validCount.lt(minObs);//counting valid observations for each pixel during current iteration.
+    //Map.addLayer(validCount, {palette: ['00FFFF', '0000FF']},'validobs count');
+    
+    // The output of the regression reduction is a 4x1 array image.
+    var harmonicTrend = reconCol
+      .select(independents1.add(dependent))
+      .reduce(ee.Reducer.ridgeRegression(independents1.length(), 1,0.5),16);
+      //.reduce(ee.Reducer.robustLinearRegression(independents.length(), 1),16);
+    
+    //print(independents1)
+    // Turn the array image into a multi-band image of coefficients.
+    var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+      .arrayProject([0])
+      .arrayFlatten([independents]);
+
+    // Compute fitted values and update the mask.
+    reconCol = reconCol.map(imgfit(harmonicTrendCoefficients));
+    
+    //var argmax=reconCol.select('residual').toBands().arrayArgmax();
+    //print(argmax)
+
+   
+    maxIter--;
+  }
+  
+   
+  //processing the user-defined output interval (timestamps)
+  if (newOut!==undefined &newOut!==null){
+    
+    //composite output timestamps based on the given interval
+    var interval =newOut.interval;
+    var startDate=ee.Image(imgCol.sort('system:time_start').first()).date();
+    var endDate=ee.Image(imgCol.sort('system:time_start',false).first()).date().advance(30,'day');
+    var voidimglist = ee.List.sequence(0, endDate.difference(startDate,'day'),interval)
+              .map(function(d){
+                return ee.Image().set('system:time_start',startDate.advance(d,'day').millis())
+                                  .rename(['void'])
+                                  .set('system:index',startDate.advance(d,'day').format('YYYY-MM-dd'));
+              });
+    //compute indepandent variables at new timestamps.  
+    var outIndependentCol = ee.ImageCollection(voidimglist)
+                      .map(addDependents)
+                      .map(addHarmonics(harmonicFrequencies));
+    //compute final result Imagecollection.
+    var newreconCol = outIndependentCol.map(function(img){
+      return img.select(independents)
+              .multiply(harmonicTrendCoefficients)
+              .reduce('sum')
+              //.clamp(-1,1)
+              .rename('fitted') 
+              //.addBands(ee.Image().rename('raw'))
+              //.addBands(ee.Image().rename(fitName))
+              .set('system:time_start',img.get('system:time_start'));
+    });
+    
+    newOut.outReconCol= newreconCol;
+    
+    
+  }
+  //print(harmonicTrendCoefficients);
+  if (coefficients !== undefined){
+    coefficients.numHarm = numHarm;
+    coefficients.coef = harmonicTrendCoefficients;
+  }
+  
+  //add another 'fitted1' band which return result with all outliers replaced by value in 'fitted',
+  //but keep other pixels unchanged. In this case, only gaps were filled by HANTS.
+  reconCol=reconCol.map(function(img){
+    var imgr=img.select(dependent);
+    var mask=imgr.mask();
+    imgr=imgr.unmask(0);
+    return img.addBands(imgr.add(img.select('fitted').multiply(ee.Image(1).subtract(mask)))
+                .select([0],['fitted1']),['fitted1']);
+    
+  });
+  
+  
+  return reconCol;
+};
+
+
+exports = {
+  whittaker : whittaker,
+  HANTS : HANTS,
+  zhou_HANTS : zhou_HANTS,
+};
