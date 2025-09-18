@@ -1,0 +1,86 @@
+// Function to merge an ImageCollection into specified time intervals
+// Parameters:
+// col        —— input ImageCollection (ee.ImageCollection)
+// timeRange  —— size of the time interval (numeric)
+// timeUnit   —— time unit (e.g., 'day', 'month', 'year')
+// reducer    —— reducer function for merging (default: median)
+var col_MergeByUnit = function (col, timeRange, timeUnit, reducer){
+  
+  // If reducer is not provided, use median by default
+  if (reducer === undefined || reducer === ""){
+    reducer = ee.Reducer.median();
+  }
+  
+  // Get the band names to preserve them after reduction
+  var bandNames = col.first().bandNames();
+  
+  // Get the first and last acquisition dates in the collection
+  var firstDate = col.sort("system:time_start", true).first().date();
+  var lastDate  = col.sort("system:time_start", false).first().date();
+  
+  // Normalize firstDate to 00:00:00 of that day
+  firstDate = firstDate.update({
+                     hour: 0,
+                     minute: 0,
+                     second: 0
+                   });
+  
+  // Normalize lastDate: advance one day and set to 00:00:00
+  // Ensures the last day is fully included
+  lastDate = lastDate.advance(1, 'day').update({
+                     hour: 0,
+                     minute: 0,
+                     second: 0
+                   });
+  
+  // Calculate the difference between firstDate and lastDate
+  // in the chosen time unit
+  var diffRange = lastDate.difference(firstDate, timeUnit);
+  
+  // Generate a list of dates separated by timeRange * timeUnit
+  var dateList = ee.List.sequence(0, diffRange, timeRange).map(function(n) {
+    return firstDate.advance(n, timeUnit);
+  });
+  
+  // Iterate over the date list and merge images within each interval
+  var mergedCol = ee.ImageCollection.fromImages(
+    dateList.map(function(d) {
+      var start = ee.Date(d);                        // interval start
+      var end   = start.advance(timeRange, timeUnit); // interval end
+      
+      // Filter the collection to the current interval
+      var subset = col.filterDate(start, end);
+      
+      // If the subset is not empty, reduce it
+      return ee.Algorithms.If(
+        subset.size().gt(0),
+        subset.reduce(reducer)       // apply reducer
+              .rename(bandNames)     // restore original band names
+              .set("system:time_start", start.millis()) // assign interval start as timestamp
+      );
+    })
+  );
+  
+  // Return the merged ImageCollection
+  return mergedCol;
+};
+
+
+// ================== Example usage ==================
+
+// Define region of interest
+var roi = ee.Geometry.Point([116.4074, 39.9042]); // Beijing
+
+// Load Sentinel-2 SR Harmonized collection
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(roi)
+  .filterDate("2021-01-01", "2021-12-31")
+  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20));
+
+// Apply function: merge every 30 days (monthly composites approx.)
+var s2_monthly = col_MergeByUnit(s2, 30, "day", ee.Reducer.median());
+
+// Visualization
+var visParams = {bands: ["B4", "B3", "B2"], min: 0, max: 3000};
+Map.centerObject(roi, 8);
+Map.addLayer(s2_monthly.first(), visParams, "Monthly Composite (First)");
