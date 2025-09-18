@@ -440,6 +440,7 @@ function zhou_HANTS(imgCol, dependent, numHarm, fet, hilo, newOut, coefficients,
 
 
 /*
+  * reference: https://spatialthoughts.com/2021/11/08/temporal-interpolation-gee/
   * Interpolating an Image Collection in GEE involves the following steps
     * Adding a time-band to each image
     * Joining the image collection with itself to find images before and after each image
