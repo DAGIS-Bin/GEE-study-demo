@@ -1,0 +1,102 @@
+//clip regions to subRegions
+
+function generateGrid_byNum(geom,xNum,yNum){
+  var coords = ee.List(geom.coordinates().get(0));
+  
+  var lons = coords.map(function(c) {
+    return ee.List(c).get(0);
+  });
+
+  var lats = coords.map(function(c) {
+    return ee.List(c).get(1);
+  });
+
+  var lonStats = ee.Dictionary(lons.reduce(ee.Reducer.minMax()));
+  var latStats = ee.Dictionary(lats.reduce(ee.Reducer.minMax()));
+  
+  var xStart = ee.Number(lonStats.get('min'));
+  var xEnd = ee.Number(lonStats.get('max'));
+  var yStart = ee.Number(latStats.get('min'));
+  var yEnd = ee.Number(latStats.get('max'));
+  // print("xmin",xmin,"ymin",ymin,"xmax",xmax,"ymax",ymax);
+  
+  var dx = xEnd.subtract(xStart).divide(xNum);
+  var dy = yEnd.subtract(yStart).divide(yNum);
+  
+  var xSequence = ee.List.sequence(xStart, xEnd, dx);//.slice(0,xNum);
+  var ySequence = ee.List.sequence(yStart, yEnd, dy);
+  // print(xSequence);
+//格网构建经纬度循环
+  var cells = xSequence.map(function(x){
+    return ySequence.map(function(y){
+      var x1 = ee.Number(x);
+      var x2 = ee.Number(x).add(dx);
+      var y1 = ee.Number(y);
+      var y2 = ee.Number(y).add(dy);
+      var coords = ee.List([x1,y1,x2,y2]);
+      var rect = ee.Algorithms.GeometryConstructors.Rectangle(coords);
+      return ee.Feature(rect);
+    });
+  }).flatten();
+  // print(cells);
+  return ee.FeatureCollection(cells);
+}
+function generateGrids_byDegree(geom, dx, dy){
+  var coords = ee.List(geom.coordinates().get(0));
+  
+  var lons = coords.map(function(c) {
+    return ee.List(c).get(0);
+  });
+
+  var lats = coords.map(function(c) {
+    return ee.List(c).get(1);
+  });
+
+  var lonStats = ee.Dictionary(lons.reduce(ee.Reducer.minMax()));
+  var latStats = ee.Dictionary(lats.reduce(ee.Reducer.minMax()));
+  
+  var xStart = ee.Number(lonStats.get('min'));
+  var xEnd = ee.Number(lonStats.get('max'));
+  var yStart = ee.Number(latStats.get('min'));
+  var yEnd = ee.Number(latStats.get('max'));
+  // print("xStart",xStart,"yStart",yStart,"xEnd",xEnd,"yEnd",yEnd);
+  
+  var xSequence = ee.List.sequence(xStart, xEnd, dx);//.slice(0,xNum);
+  var ySequence = ee.List.sequence(yStart, yEnd, dy);
+  // print(xSequence);
+  // print(ySequence);
+  
+  var cells = xSequence.map(function(x){
+    return ySequence.map(function(y){
+      var x1 = ee.Number(x);
+      var x2 = ee.Number(x).add(dx);
+      var y1 = ee.Number(y);
+      var y2 = ee.Number(y).add(dy);
+      var coords = ee.List([x1,y1,x2,y2]);
+      var rect = ee.Algorithms.GeometryConstructors.Rectangle(coords);
+      return ee.Feature(rect);
+    });
+  }).flatten();
+  return ee.FeatureCollection(cells);
+}
+
+
+var geometry = ee.Geometry.Polygon(
+        [[[108, 30],
+          [109, 30],
+          [109, 31],
+          [108, 31]]], null, false);
+Map.addLayer(geometry, {color:'blue'})
+
+var grids = generateGrid_byNum(geometry,5,5);
+print("generateGrid_byNum", grids);
+Map.addLayer(grids, {color:'white'}, "generateGrid_byNum");
+
+var grids = generateGrids_byDegree(geometry, 1, 1);
+print("grnrrateGrids_byDegree", grids);
+Map.addLayer(grids, {color:'red'}, "grnrrateGrids_byDegree");
+
+exports = {
+  generateGrid_byNum : generateGrid_byNum,
+  generateGrids_byDegree : generateGrids_byDegree
+}
