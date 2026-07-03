@@ -1,0 +1,97 @@
+Map.setOptions({
+  mapTypeId: "SATELLITE",
+});
+
+var year = 2020;
+var roiName = "California";
+// var roiName = "Arkansas";
+var studyArea = geometry;
+Map.centerObject(studyArea, 11);
+
+  year = 2021;
+  var CDL = ee.ImageCollection("USDA/NASS/CDL")
+  .filter(ee.Filter.calendarRange({
+      start: year,
+      end: year,
+      field: "year",
+  })).first().select("cropland").clip(studyArea);
+  Map.addLayer(CDL, {}, "CDL");
+
+  var cropBand = CDL.select("cropland");
+
+  // ========== 手动填写需要的CDL作物编码 ==========
+  var classValues = ee.List([1, 2, 3, 4, 5, 6, 23, 24, 61, 75, 76, 111, 143, 176, 190, 195]);
+
+  // 单类分割函数（修复eq传数字报错）
+  function singleClassSegment(classVal) {
+    // 修复：数字转图像再eq，消除类型报错
+    var singleMask = cropBand.eq(ee.Number(classVal));
+    var singleImg = cropBand.updateMask(singleMask);
+    
+    var snic = ee.Algorithms.Image.Segmentation.SNIC({
+      image: singleImg,
+      size: 20,
+      compactness: 0.6,
+      connectivity: 8
+    });
+    var segClusters = snic.select("clusters");
+    
+    var vec = segClusters.reduceToVectors({
+      reducer: ee.Reducer.countEvery(),
+      scale: 30,
+      maxPixels: 1e13,
+      geometry: studyArea,
+      tileScale: 4
+    });
+    // 给每个图斑绑定当前CDL编码
+    return vec.map(function(f){
+      return f.set("cropland", classVal);
+    });
+  }
+
+  // 批量处理所有手动指定类别，合并矢量
+  var allClassVecList = classValues.map(singleClassSegment);
+  var segPolygons = ee.FeatureCollection(allClassVecList).flatten();
+  print("手动指定类别分割后总图斑数", segPolygons.size());
+
+
+  // // 形状指标计算（带误差容限）
+  function addShapeMetrics(feat) {
+    var geom = feat.geometry();
+    var area = geom.area(ee.ErrorMargin(1));
+    var perimeter = geom.perimeter(ee.ErrorMargin(1));
+    var compactness = ee.Number(4).multiply(Math.PI).multiply(area).divide(perimeter.pow(2));
+    return feat.set({
+      area: area,
+      perimeter: perimeter,
+      compactness: compactness
+    });
+  }
+  var polyWithMetric = segPolygons.map(addShapeMetrics);
+
+  // 过滤长条、碎斑
+  var compactThresh = 0.3;
+  var minArea = 30*30*6;
+  var validPolygons = polyWithMetric
+    // .filter(ee.Filter.gt("compactness", compactThresh))
+    .filter(ee.Filter.gt("area", minArea));
+  print("剔除长条+碎斑后图斑数量", validPolygons.size());
+  Map.addLayer(validPolygons, {color:"#2E8B57"}, "图斑");
+
+  // 提取图斑中心点
+  var polyCenters = validPolygons.map(function(feat){
+    var center = feat.geometry().centroid(ee.ErrorMargin(1));
+    return ee.Feature(center, feat.toDictionary());
+  });
+  Map.addLayer(polyCenters, {color:"red", pointSize:3}, "图斑中心点");
+  print("图斑中心点矢量集合", polyCenters.size());
+  
+  
+  
+  Export.table.toAsset({
+    collection: polyCenters,
+    description: roiName + "_samples" + year,
+    assetId: '../' + roiName + "_samples" + year,
+    // priority:,
+    overwrite:true,
+  })
